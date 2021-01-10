@@ -20,14 +20,15 @@ MODULE_LICENSE("GPL");
 
 
 makefile文件
-obj-m := xfmodule_1.o
+obj-m := mokuai1.o
+# kernel directory 源码所在文件夹，这里直接指向了系统文件中的内核源码，也可以将该路径改为你下载的源码路径
 KDIR := /lib/modules/$(shell uname -r)/build
+# 当前路径
 PWD := $(shell pwd)
 default:
-make -C $(KDIR) M=$(PWD) modules
+	make -C $(KDIR) M=$(PWD) modules
 clean:
-make -C $(KDIR) M=$(PWD) clean
-
+	make -C $(KDIR) M=$(PWD) clean
 
 模块2
 #include<linux/init.h>
@@ -73,10 +74,12 @@ module_init(ltmodule_2_init);
 module_exit(ltmodule_2_exit);
 MODULE_LICENSE("GPL");
 模块二 Makefile 文件 
-obj-m := xfmodule_2.o
- KDIR := /lib/modules/$(shell uname -r)/build
- PWD := $(shell pwd)
+# created by 19-03-26
+# Arcana
+obj-m := mokuai2.o
+KDIR := /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
 default:
- make -C $(KDIR) M=$(PWD) modules
-clean: 
- make -C $(KDIR) M=$(PWD) clean
+	make -C $(KDIR) M=$(PWD) modules
+clean:
+	make -C $(KDIR) M=$(PWD) clean
