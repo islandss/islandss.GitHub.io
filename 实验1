@@ -1,0 +1,144 @@
+setnice
+
+syscall.h
+
+asmlinkage long sys_mysetnice(pid_t pid, int flag, int nicevaluse, void __user* prio, void __user* nice);
+
+ sys.c
+
+SYSCALL_DEFINE5(mysetnice,pid_t,pid,int,flag,int,nicevalue,void __user*,prio,void __user*,nice){
+ struct pid * kpid;
+ struct task_struct * task;
+ kpid = find_get_pid(pid);/* 返回pid */
+ task = pid_task(kpid, PIDTYPE_PID);/* 返回task_struct */
+ int n;
+ n = task_nice(task);/* 返回进程当前nice值 */
+ int p;
+ p = task_prio(task);/*返回进程当前prio值*/
+ if(flag == 1)
+    {
+ set_user_nice(task, nicevalue);/* 修改进程nice值 */
+ n = task_nice(task);/*重新取得进程nice值*/
+ p = task_prio(task);/*重新获取进程prio值 这里和参考资料不一样!!! */
+ copy_to_user(nice,&n,sizeof(n));/*将nice值拷贝到用户空间*/
+ copy_to_user(prio,&p,sizeof(p));/*将prio值拷贝到用户空间*/
+ return 0;  
+    }
+ else if(flag == 0)
+    {
+ copy_to_user(nice,&n,sizeof(n));/*将nice值拷贝到用户空间*/
+ copy_to_user(prio,&p,sizeof(p));/*将prio值拷贝到用户空间*/
+ return 0;
+    }
+ return EFAULT;
+}
+
+测试
+
+#include "unistd.h"
+#include "sys/syscall.h"
+#include "stdio.h"
+#define _SYSCALL_MYSETNICE_ 335
+#define EFALUT 14
+int main()
+{
+	int pid, flag, nicevalue;
+	int prev_prio, prev_nice, cur_prio, cur_nice;
+	int result;
+	printf("Please input variable(pid, flag, nicevalue): ");
+	scanf("%d%d%d", &pid, &flag, &nicevalue);
+	result = syscall(_SYSCALL_MYSETNICE_, pid, 0, nicevalue, &prev_prio,&prev_nice);
+	if (result == EFALUT)
+	{
+		printf("ERROR!");
+		return 1;
+	}
+	if (flag == 1)
+	{
+		syscall(_SYSCALL_MYSETNICE_, pid, 1, nicevalue, &cur_prio, &cur_nice);
+		printf("Original priority is: [%d], original nice is [%d]\n", prev_prio,prev_nice);
+		printf("Current priority is : [%d], current nice is [%d]\n", cur_prio,cur_nice);
+	}
+	else if (flag == 0)
+	{
+		printf("Current priority is : [%d], current nice is [%d]\n", prev_prio,prev_nice);
+	}
+	return 0;
+}	
+
+地址和进程状态（我第三个做一半老师说不用做所以有进程状态）
+因为SYSCALL_DEFINE参数最多6个，所以我用了两个系统调用
+syscall.h
+
+asmlinkage long sys_mygettask1(pid_t pid,void __user* start_code, void __user* end_code,  void __user* start_data,void __user* end_data);
+asmlinkage long sys_mygettask2(pid_t pid,void __user* start_stack,void __user* start_brk,void __user* state);
+
+sys.c
+
+SYSCALL_DEFINE5(mygettask1,pid_t,pid,void __user*,start_code,void __user*,end_code,void __user*,start_data,void __user*,end_data){
+    struct pid * kpid;
+    struct task_struct * task;
+    struct mm_struct *mm;
+    unsigned long sc,ec,sd,ed; 
+    kpid = find_get_pid(pid);/* 返回pid */
+    task = pid_task(kpid, PIDTYPE_PID);/* 返回task_struct */
+    mm = get_task_mm (task);
+    sc=mm->start_code;
+    ec=mm->end_code;
+    sd=mm->start_data;
+    ed=mm->end_data;
+    copy_to_user(start_code,&sc,sizeof(sc));
+    copy_to_user(end_code,&ec,sizeof(ec));
+    copy_to_user(start_data,&sd,sizeof(sd));
+    copy_to_user(end_data,&ed,sizeof(ed));
+    return 0;
+}
+
+SYSCALL_DEFINE4(mygettask2,pid_t,pid,void __user*,start_stack,void __user*,start_brk,void __user*,state){
+    struct pid * kpid;
+    struct task_struct * task;
+    struct mm_struct *mm;
+    unsigned long ss,sb; 
+    long st;
+    kpid = find_get_pid(pid);/* 返回pid */
+    task = pid_task(kpid, PIDTYPE_PID);/* 返回task_struct */
+    mm = get_task_mm (task);
+    ss=mm->start_stack;
+    sb=mm->start_brk;
+    st=task->state;
+    copy_to_user(start_stack,&ss,sizeof(ss));
+    copy_to_user(start_brk,&sb,sizeof(sb));
+    copy_to_user(state,&st,sizeof(st));
+    return 0;
+}
+
+测试
+
+//test2.c
+#include "unistd.h"
+#include "sys/syscall.h"
+#include "stdio.h"
+#define _SYSCALL_MYGETTASK1_ 338
+#define EFALUT 14
+int main()
+{
+    int pid;
+    unsigned long start_code,end_code,start_data,end_data,start_stack,start_brk,state;
+    int result1,result2;
+
+    printf("Please input variable(pid): ");
+    scanf("%d", &pid);
+    
+    result1 = syscall(338, pid, &start_code,&end_code,&start_data,&end_data);
+    result2 = syscall(339, pid, &start_stack,&start_brk,&state);
+    if (result1 == EFALUT||result2 == EFALUT)
+    {
+        printf("ERROR!");
+        return 1;
+    }
+    
+    printf("start_code:%lu\nend_code:%lu\nstart_data:%lu\nend_data:%lu\n",start_code,end_code,start_data,end_data);
+    printf("start_stack:%lu\nstart_brk:%lu\nstate:%lu\n",start_stack,start_brk,state);
+    
+    return 0;
+}
