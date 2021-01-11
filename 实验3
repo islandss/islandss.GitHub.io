@@ -1,0 +1,511 @@
+管道
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+
+#include <stdlib.h>
+#include <semaphore.h>//信号量头文件
+#include <signal.h>
+
+#define MAX_PIPE_CAPACIPY 100
+
+
+int main()
+{
+    int fd[2];
+    sem_t *Mutex;
+    sem_t *send1, *send2, *send3;
+    sem_t *receive1, *receive2, *receive3;
+   //定义信号量 sem_t类似int，char
+
+    sem_unlink("Mutex");
+    sem_unlink("send1");
+    sem_unlink("send2");
+    sem_unlink("send3");
+    sem_unlink("receive1");
+    sem_unlink("receive2");
+    sem_unlink("receive3");
+    //删除信号量，sem_unlike(P90)只对引用计数为0的信:号量有用，对计数量不为0的信号量不起作用
+
+    Mutex = sem_open("Mutex", O_CREAT, 0666, 1);
+    send1 = sem_open("send1", O_CREAT, 0666, 1);
+    send2 = sem_open("send2", O_CREAT, 0666, 1);
+    send3 = sem_open("send3", O_CREAT, 0666, 1);
+    receive1 = sem_open("receive1", O_CREAT, 0666, 0);
+    receive2 = sem_open("receive2", O_CREAT, 0666, 0);
+    receive3 = sem_open("receive3", O_CREAT, 0666, 0);
+    //sem_open(P89)打开一个已存在的有名信号量，或创建并初始化一个有名信号量，并将其引用数加1
+
+    int ret = pipe(fd);
+    //无名管道，int pipe()创建无名管道(P118)
+    if (ret == -1)  //无名管道创建失败
+    {
+        printf("pipe create error\n");
+        exit(-1);
+    }
+
+
+    pid_t pid1;
+    pid_t pid2;
+    pid_t pid3;
+   //管道pid1，pid2，pid3
+   //    pid1 = fork();
+   //    pid2 = fork();
+   //    pid3 = fork();
+
+    pid1=fork();
+    if(pid1 == 0) //管道1创建成功
+    {
+        close(fd[0]); //关闭读管道
+        sem_wait(send1); //等待send1信号量空闲
+        sem_wait(Mutex); //等待Mutex信号量空闲
+
+        char c='1';
+        write(fd[1], c, sizeof(c));
+        printf("pid:%d 进程1放入数据:%s\n",getpid(),c);
+
+
+        sleep(1); //执行挂起1s，返回值：若进程/线程挂起到参数所指定的时间则返回0，若有信号中断则返回剩余秒数
+
+        sem_post(receive1); //释放receive信号量
+        sem_post(Mutex); //释放Mutex信号量
+       //sem_post(P89)
+
+//        exit(0);
+    }
+    pid2=fork();
+    if(pid2 == 0)
+    {
+        close(fd[0]);
+        sem_wait(send2);
+        sem_wait(Mutex);
+
+        char c='2';
+        write(fd[1], c, sizeof(c));
+        printf("pid:%d 进程2放入数据:%s\n",getpid(),c);
+
+        sleep(1);
+
+        sem_post(receive2);
+        sem_post(Mutex);
+    }
+    pid3=fork();
+    if(pid3 == 0)
+    {
+        close(fd[0]);
+        sem_wait(send3);
+        sem_wait(Mutex);
+
+        char c="3";
+        write(fd[1], c, sizeof(c));
+        printf("pid:%d 进程3放入数据:%s\n",getpid(),c);
+
+        sleep(1);
+
+        sem_post(receive3);
+        sem_post(Mutex);
+
+    }
+    else
+    {
+        close(fd[1]);
+
+
+        sem_wait(receive1);
+        sem_wait(receive2);
+        sem_wait(receive3);
+        sem_wait(Mutex);
+      //阻塞型申请资源操作(P88)
+
+        char str[1024];
+
+        read(fd[0], str, 1024);
+
+        printf("pid:%d 父进程接收数据:%s\n", getpid(), str);
+
+        sleep(1);
+
+        sem_post(send1);
+        sem_post(send2);
+        sem_post(send3);
+        sem_post(Mutex);
+
+
+        exit(0);
+    }
+
+    return 0;
+}
+
+
+（4）利用 linux 的消息队列通信机制实现两个线程间的通信： 
+编写程序创建两个线程：sender 线程和 receive 线程，其中 sender 线程运行函数 sender()， 
+它创建一个消息队列，然后，循环等待用户通过终端输入一串字符，将这串字符通过消息队 
+列发送给 receiver 线程，直到用户输入“exit”为止；最后，它向 receiver 线程发送消息“end”， 
+并且等待 receiver 的应答，等到应答消息后，将接收到的应答信息显示在终端屏幕上，删除 
+相关消息队列，结束程序的运行。Receiver 线程运行 receive()，它通过消息队列接收来自 
+sender 的消息，将消息显示在终端屏幕上，直至收到内容为“end”的消息为止，此时，它 
+向 sender 发送一个应答消息“over”，结束程序的运行。使用无名信号量实现两个线程之间 
+的同步与互斥。
+代码实现：
+Receiver.c
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include <sys/msg.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include<unistd.h>
+#include<fcntl.h>
+
+#include <pthread.h>
+#include <semaphore.h>//信号量头文件
+
+sem_t *sem_send;
+sem_t *sem_receive;
+sem_t *sem_over;
+
+//缓冲区mymsg
+struct my_msgbuf
+{
+    long mtype;//消息类型1为发送者的消息，2为接收的消息。
+   // int sendid;//1为发送者1，2为发送者2。
+    char mtext[100];
+};
+
+void init_signal()
+{
+        sem_unlink("send");
+        sem_unlink("receive");
+        sem_unlink("over");
+
+    //初始化信号量
+    sem_send = sem_open("send", O_CREAT, 0666, 1);
+    sem_receive = sem_open("receive", O_CREAT, 0666, 0);
+    sem_over = sem_open("over", O_CREAT, 0666, 0);
+
+
+}
+
+int main(){
+        int msgid;
+        int msgid2;
+        key_t key1;
+        key_t key2;
+
+        init_signal();
+
+        char str[100];
+
+        struct my_msgbuf r_msg;//接收缓冲区
+        struct my_msgbuf s_msg;//发送缓冲区
+        s_msg.mtype=12;
+
+        key1=ftok("tp_key/key1",'b');   //获得一个id号
+        msgid=msgget(key1,IPC_CREAT|0666);   //创建一个新的发送消息队列
+        key2=ftok("tp_key/key2",'a');
+        msgid2=msgget(key2,IPC_CREAT|0666);  //创建一个新的接收消息队列
+
+        while(1){
+
+        sem_wait(sem_receive);
+
+        msgrcv(msgid,&r_msg, sizeof(struct my_msgbuf), 0, 0); //接收消息
+        printf("线程receiver收到线程sender的消息: %s\n", r_msg.mtext);
+
+        if(strcmp(r_msg.mtext,"end")==0)
+        {
+                strcpy(s_msg.mtext,"over");
+                printf("结束,receiver向sender发送了消息:over\n");
+                msgsnd(msgid2,&s_msg,sizeof(struct my_msgbuf),0);
+                sem_post(sem_over);
+                break;
+        }
+        else{
+                sem_post(sem_send);
+
+        }
+
+
+
+        }
+
+        int ret;
+        ret=msgctl(msgid, IPC_RMID,NULL); //释放资源
+        if(-1 == ret)
+        {
+                printf("删除消息失败\n");
+        }
+
+
+        return 0;
+
+
+}
+
+
+
+
+Sender.c
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include <sys/msg.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include<unistd.h>
+#include<fcntl.h>
+
+#include <pthread.h>
+#include <semaphore.h>//信号量头文件
+
+sem_t *sem_send;
+sem_t *sem_receive;
+sem_t *sem_over;
+
+//缓冲区mymsg
+struct my_msgbuf
+{
+    long mtype;//消息类型1为发送者的消息，2为接收的消息。
+    char mtext[100];
+};
+
+void init_signal()
+{
+  sem_unlink("send");
+
+sem_unlink("receive");
+
+sem_unlink("over");
+
+    //初始化信号量
+    sem_send = sem_open("send", O_CREAT, 0666, 1);
+    sem_receive = sem_open("receive", O_CREAT, 0666, 0);
+    sem_over = sem_open("over", O_CREAT, 0666, 0);
+
+
+}
+
+int main(){
+        int msgid;
+        int msgid2;
+        key_t key1;
+        key_t key2;
+
+        init_signal(); //定义信号量
+
+        char str[100];
+        struct my_msgbuf s_msg;  //加载缓冲取
+        s_msg.mtype=11;
+
+        key1=ftok("tp_key/key1",'b');
+        msgid=msgget(key1,IPC_CREAT|0666); //创建新的发送消息队列
+        key2=ftok("tp_key/key2",'a');
+        msgid2=msgget(key2,IPC_CREAT|0666); //创建新的接收消息队列
+
+        while(1){
+
+        memset(str,'\0',strlen(str)); //str初始化
+        printf("线程sender发送:");
+        scanf("%s",str);
+
+        sem_wait(sem_send);
+
+        if(strcmp(str,"exit")==0)
+        {
+                strcpy(s_msg.mtext,"end"); //将end复制到发送者缓冲区的s_msg.mtext
+                msgsnd(msgid,&s_msg,sizeof(struct my_msgbuf),11); 
+//将缓冲区消息发送到消息队列
+                sem_post(sem_receive);
+                break;
+        }
+
+        strcpy(s_msg.mtext,str); 
+//将发送者要发送的内容复制到发送者缓冲区的s_msg.mtext
+
+msgsnd(msgid,&s_msg,sizeof(struct my_msgbuf),11); 
+//将缓冲区消息发送到消息队列
+
+        sem_post(sem_receive);
+
+
+        }
+
+        sem_wait(sem_over);
+        struct my_msgbuf r_msg;
+        msgrcv(msgid2,&r_msg,sizeof(struct my_msgbuf),0,0);//接收消息
+        printf("结束，收到receiver的消息:%s\n",r_msg.mtext);
+        //将接收消息队列的消息复制到消息缓冲区
+        sem_post(sem_send);
+       / int ret;
+        ret=msgctl(msgid2, IPC_RMID,NULL);
+        if(-1 == ret)
+        {
+                printf("删除消息失败\n");
+                return 0;
+        }/
+
+
+        return 0;
+
+
+}
+
+
+（5）利用 linux 的共享内存通信机制实现两个进程间的通信： 
+编写程序 sender，它创建一个共享内存，然后等待用户通过终端输入一串字符，并将这 
+串字符通过共享内存发送给 receiver；最后，它等待 receiver 的应答，收到应答消息后，将 
+接收到的应答信息显示在终端屏幕上，删除共享内存，结束程序的运行。编写 receiver 程序， 
+它通过共享内存接收来自 sender 的消息，将消息显示在终端屏幕上，然后再通过该共享内 
+存向 sender 发送一个应答消息“over”，结束程序的运行。使用有名信号量或 System V 信号 
+量实现两个进程对共享内存的互斥及同步使用。
+代码实现：
+Receiver.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
+#include <semaphore.h>//信号量头文件
+#include <glob.h>
+#include<fcntl.h>
+
+#define MEM_SIZE 1024
+
+
+int main(){
+
+
+        sem_t *sem_send;
+        sem_t *sem_receive;
+        sem_t *sem_over;
+
+        key_t key;
+        int shmid;//共享内存ID
+        void *shmp;
+
+        sem_unlink("send");
+        sem_unlink("receive");
+        sem_unlink("over");
+
+        sem_send = sem_open("send", O_CREAT, 0666, 1);
+        sem_receive = sem_open("receive", O_CREAT, 0666, 0);
+        sem_over = sem_open("over", O_CREAT, 0666, 0);
+
+
+
+
+
+        key=ftok("tok/key",'a');
+
+        sem_wait(sem_receive);
+
+        shmid=shmget(key,MEM_SIZE,0666|IPC_CREAT);//创建共享内存 shmget:创建一块共享内存，若已存在，则返回其标识符(P125)
+        if(shmid < 0)
+        {
+        printf("创建共享内存出错！\n");
+        exit(-1);
+        }
+
+        shmp=shmat(shmid,NULL,0);//shmat()指定共享内存映射到新虚拟地址空间，返回起始地址
+
+
+
+        char recv[100];
+        strcpy(recv,(char *)shmp);
+
+        printf("receiver接受到一条消息:%s\n",recv);
+
+        printf("receiver发送应答消息:over\n");
+
+        char s_str[100]="over";
+        memset((char *)shmp, '\0', MEM_SIZE);
+        strcpy((char *)shmp,s_str);
+
+
+        sem_post(sem_over);
+
+
+        shmdt(shmp); //shmdt()断开共享内存在调用进程中的映射，禁止本程序访问此内存(P125)
+        int ret;
+        ret=shmctl(shmid, IPC_RMID, NULL);//删除共享内存(P125)
+        if(ret==-1){
+                printf("共享内存删除失败！\n");
+                return 0;
+        }
+        return 0;
+
+}
+
+Sender.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
+#include <semaphore.h>//信号量头文件
+#include <glob.h>
+#include<unistd.h>
+#include<sys/types.h>
+#include<fcntl.h>
+
+#define MEM_SIZE 1024
+
+
+int main(){
+
+
+        sem_t *sem_send;
+        sem_t *sem_receive;
+        sem_t *sem_over;
+
+        key_t key;
+        int shmid;//共享内存ID
+        void *shmp;
+
+        key=ftok("tok/key",'a');
+
+        sem_send = sem_open("send", O_CREAT, 0666, 1);
+        sem_receive = sem_open("receive", O_CREAT, 0666, 0);
+        sem_over = sem_open("over", O_CREAT, 0666, 0);
+
+        shmid=shmget(key,MEM_SIZE,0666|IPC_CREAT);//创建共享内存
+        if(shmid < 0)
+        {
+        printf("创建共享内存出错！\n");
+        exit(-1);
+        }
+
+        shmp=shmat(shmid,NULL,0);//指定共享内存映射到新虚拟地址空间，返回起始地址
+
+        memset((char *)shmp,'\0',MEM_SIZE);//初始化共享内存
+
+        sem_wait(sem_send);
+
+        char s_str[100];
+        char temp[MEM_SIZE];
+        printf("sender向receiver发送一条消息:");
+        scanf("%s",s_str);
+
+        strcpy(temp, (char *)shmp);//shmp此时是空，用shmp将temp初始化
+        strcat(temp,s_str);//将s_str中的内容复制到temp中
+        strcpy((char *)shmp,temp);//将temp中的内容复制到shmp中
+
+        sem_post(sem_receive);
+
+
+        sem_wait(sem_over);
+
+        char r_str[100];
+        strcpy(r_str,(char *)shmp);//将shmp中的内容复制到r_str中
+        printf("结束，sender接收到:%s\n",r_str);
+
+        shmdt(shmp);
