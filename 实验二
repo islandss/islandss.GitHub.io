@@ -74,8 +74,7 @@ module_init(ltmodule_2_init);
 module_exit(ltmodule_2_exit);
 MODULE_LICENSE("GPL");
 模块二 Makefile 文件 
-# created by 19-03-26
-# Arcana
+
 obj-m := mokuai2.o
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
