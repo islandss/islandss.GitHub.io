@@ -1,0 +1,1018 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <string.h>
+
+
+
+
+
+#define BLOCKSIZE 	1024
+#define SIZE		1024*1000
+#define END		0xffff
+#define FREE		0
+#define NOTFREE		1
+#define ROOTBLOCKNUM	2
+#define MAXOPENFILE	10
+
+#define MOVE		0
+#define FILL		1
+
+#define ROW		40
+#define COL		25
+
+struct FCB
+{
+	unsigned long fd;		//文件描述符
+	char filename[8];		//文件名
+//	char exname[3];			//文件扩展名
+	unsigned short attribute;	//0：目录文件 1：数据文件
+	unsigned short hour;		//文件创建时间
+	unsigned short min;		//文件创建时间
+	unsigned short mon;		//文件创建日期
+	unsigned short day;		//文件创建日期
+	unsigned short first;		//文件起始盘块号
+	unsigned long length;		//文件长度（字节）
+	int free;			//表示目录项是否为空，0：空 1：非空
+};
+
+struct USEROPEN
+{
+	unsigned long fd;		//文件描述符
+	char filename[8];		//文件名
+	char exname[3];			//文件扩展名
+	unsigned char attribute;	//0：目录文件 1：数据文件
+	unsigned short time;		//文件创建时间
+	unsigned short date;		//文件创建日期
+	unsigned short first;		//文件起始盘块号
+	unsigned long length;		//文件长度（字节）
+
+
+	struct FCB* file;	
+	//文件使用中的动态信息
+	char dir[80];			//打开文件所在的路径
+	int count;			//读写指针
+	char fcbstate;			//是否被修改 1：修改 0：未修改
+	int topenfile;			//打开表项是否为空 0：空 1：非空
+};
+
+struct BLOCK0
+{
+	char info[200];			//存储一些描述信息
+	unsigned short root;		//根目录文件的起始盘块号
+	unsigned char* startblock;	//虚拟磁盘上数据区开始的位置
+};
+
+struct bitGraph
+{
+	short graph[ROW][COL];
+};
+
+struct FAT
+{
+	unsigned short id;		//0：FAT1 1：FAT2
+	long table[SIZE/BLOCKSIZE];	//FAT表
+};
+
+
+unsigned char* myvhard;					//指向虚拟磁盘的起始地址
+struct USEROPEN openfilelist[MAXOPENFILE];		//用户打开文件表数组
+int curdir;						//当前目录的文件描述符fd
+char currentdir[80];					//当前目录的目录名（包括目录的路径）
+unsigned char* startp;					//记录虚拟磁盘上数据区的开始位置
+unsigned char* FAT1;					//FAT1的起始位置
+unsigned char* FAT2;					//FAT2的起始位置
+unsigned char* block0;					//引导块起始位置
+struct bitGraph* bitgraph;				//位示图
+long fd = 0;						//文件描述符
+struct FCB* root;					//根目录FCB
+struct FCB* curfcb;					//当前目录的FCB
+
+void init_bitgraph()
+{
+	bitgraph = (struct bitGraph*)malloc(sizeof(struct bitGraph));
+	for(int i=0;i<7;i++)
+		(bitgraph -> graph[0][i]) = NOTFREE;
+	for(int i=7;i<COL;i++)
+		(bitgraph -> graph[0][i]) = FREE;
+	for(int i=1;i<ROW;i++)
+		for(int j=0;j<COL;j++)
+			(bitgraph -> graph[i][j]) = FREE;
+}
+
+/**
+ * 更新位示图，参数为磁盘块号和操作码
+ */
+void update_bitgraph(int block, int flag)
+{
+	int i, j;
+	if(flag > SIZE/BLOCKSIZE)
+	{
+		printf("block out of range !\n");
+		return;
+	}
+	i = (block-1) / ROW;
+	j = (block-1) % COL;
+	if(flag == FILL)
+		bitgraph -> graph[i][j] = NOTFREE;
+	else if(flag == MOVE)
+		bitgraph -> graph[i][j] = FREE;
+	else
+	{
+		printf("failed when update bitgraph because of wrong flag\n");
+		return;
+	}
+}
+
+/**
+ * 返回位示图中第一个空闲盘块号
+ */
+int get_free_block()
+{
+	for(int i = 0;i < ROW;i++)
+		for(int j = 0;j < COL;j++)
+			if(bitgraph -> graph[i][j] == FREE)
+				return ROW*i + j + 1;
+}
+
+void init_FAT()
+{
+	//一开始把FAT表的所有表项初始化为END
+	for(int i=0;i < SIZE/BLOCKSIZE;i++)
+	{
+		((struct FAT*)FAT1) -> table[i] = END;
+		((struct FAT*)FAT2) -> table[i] = END;
+	}
+
+	((struct FAT*)FAT1) -> table[0] = END;
+	((struct FAT*)FAT1) -> table[1] = 2;
+	((struct FAT*)FAT1) -> table[2] = END;
+	((struct FAT*)FAT1) -> table[3] = 4;
+	((struct FAT*)FAT1) -> table[4] = END;
+	((struct FAT*)FAT1) -> table[5] = 6;
+	((struct FAT*)FAT1) -> table[6] = END;
+	
+	((struct FAT*)FAT2) -> table[0] = END;
+	((struct FAT*)FAT2) -> table[1] = 2;
+	((struct FAT*)FAT2) -> table[2] = END;
+	((struct FAT*)FAT2) -> table[3] = 4;
+	((struct FAT*)FAT2) -> table[4] = END;
+	((struct FAT*)FAT2) -> table[5] = 6;
+	((struct FAT*)FAT2) -> table[6] = END;
+}
+
+
+/**
+ * 当盘块不够时新分配一个
+ * 当盘块太多时回收一个
+ */
+void update_FAT(struct FCB* file, int flag)
+{
+	int i = file -> first;
+	int j = i;
+	while(((struct FAT*)FAT1) -> table[i] != END)
+	{
+		j = i;
+		i = ((struct FAT*)FAT1) -> table[i];
+	}
+	if(flag == FILL)
+	{
+		int free = get_free_block();
+		((struct FAT*)FAT1) -> table[i] = free;
+		((struct FAT*)FAT1) -> table[free] = END;
+		((struct FAT*)FAT2) -> table[i] = free;
+		((struct FAT*)FAT2) -> table[free] = END;
+	}
+	else if(flag == MOVE)
+	{
+		update_bitgraph(i, MOVE);
+		((struct FAT*)FAT1) -> table[j] = END;
+		((struct FAT*)FAT2) -> table[j] = END;
+	}
+}
+
+/**
+ * 找到以block为初始块的文件的最后一个块
+ * 出错则返回-1
+ */
+int along_FAT(int block)
+{
+	int index = block;
+	for(int i = 0;i < SIZE/BLOCKSIZE;i++)
+	{
+		if(((struct FAT*)FAT1) -> table[index] == END)
+			return index;
+		index = ((struct FAT*)FAT1) -> table[index];
+	}
+	return -1;
+}
+
+
+int FAT_next(int block)
+{
+	return ((struct FAT*)FAT1) -> table[block];
+}
+
+/**
+ * 传入参数是盘块号
+ * 返回该盘块号的起始地址
+ */
+char* get_add(int block)
+{
+	return myvhard + block * BLOCKSIZE;
+}
+
+/*
+ * 检查文件是否存在
+ * 若存在则返回该文件FCB在当前目录磁盘块中的位置
+ * 不存在则返回-1
+ */
+int test_exist(char* filename, int attribute)
+{
+	char* first_add = get_add(curfcb->first);
+	struct FCB* t = (struct FCB*)first_add;
+	for(int i = 0;i < curfcb->length/sizeof(struct FCB);i++)
+	{
+		if(strcmp((t+i)->filename, filename) == 0 && (t+i)->attribute == attribute)
+			return i;
+	}
+	return -1;
+}
+
+
+/*
+ * 格式化虚拟磁盘，给引导块、FAT1、FAT2和根目录分配磁盘块
+ * 同时初始化FAT1、FAT2和位示图
+ */
+void my_format()
+{
+	time_t ptime;
+	struct tm* p;
+	time(&ptime);
+	p = gmtime(&ptime);
+
+	//分配虚拟磁盘空间
+	myvhard = (char*)malloc(SIZE);
+	block0 = myvhard;					//initial
+	FAT1 = block0 + BLOCKSIZE;
+	FAT2 = FAT1 + 2 * BLOCKSIZE;
+	startp = FAT2 + 2 * BLOCKSIZE;
+
+	((struct FAT*)FAT1) -> id = 0;				//init FAT
+	((struct FAT*)FAT2) -> id = 1;	
+	init_FAT();
+	
+	//初始化位示图
+	init_bitgraph();
+
+	//初始化引导块
+	((struct BLOCK0*)block0) -> root = 5;			//盘块从0开始编号
+	((struct BLOCK0*)block0) -> startblock = startp;
+
+	//初始化根目录FCB
+	root = (struct FCB*)malloc(sizeof(struct FCB));
+//	root = (struct FCB*)(myvhard + 5 * BLOCKSIZE);
+	root -> fd = fd++;
+	strcpy(root -> filename, "root");
+	strcpy(root -> filename, "");
+	(root -> attribute) = 0;
+	(root -> hour) = p -> tm_hour;
+	(root -> min) = p -> tm_min;
+	(root -> mon) = p -> tm_mon;
+	(root -> day) = p -> tm_mday;
+	(root -> first) = 5;
+	(root -> length) = 2*sizeof(struct FCB);
+	(root -> free) = 0;
+	
+	char* first_add = get_add(5);
+	struct FCB* t = (struct FCB*)first_add;
+	strcpy(t->filename,".");
+	t -> attribute = 0;
+	(t)->hour = p->tm_hour;
+	(t)->min = p->tm_min;
+	(t)->mon = p->tm_mon;
+	(t)->day = p->tm_mday;
+	(t)->first = 5;
+	(t)->length = sizeof(struct FCB);
+	(t)->free = 0;
+
+	strcpy((t+1)->filename,"..");
+	(t+1) -> attribute = 0;
+	(t+1)->hour = p->tm_hour;
+	(t+1)->min = p->tm_min;
+	(t+1)->mon = p->tm_mon;
+	(t+1)->day = p->tm_mday;
+	(t+1)->first = 5;
+	(t+1)->length = root->length;
+	(t+1)->free = 0;
+	
+
+	//初始化openfilelist
+	for(int i = 0;i < MAXOPENFILE;i++)
+		openfilelist[i].topenfile = 0;
+	strcpy(currentdir, " /");
+	curdir = 0;
+	curfcb = root;
+}
+
+//开启系统
+void startsys()
+{
+	FILE* mem = fopen("mem","r");
+	FILE* var = fopen("var","r");
+	//如果是第一次启动系统，则调用my_format
+	if(mem == NULL || var == NULL)
+	{
+		my_format();
+		return;
+	}
+	//重新分配一段内存空间
+	myvhard = (char*)malloc(sizeof(char)*SIZE);
+	fread(myvhard, sizeof(char), SIZE, mem);
+	block0 = myvhard;
+	FAT1 = myvhard + BLOCKSIZE;
+	FAT2 = myvhard + 3 * BLOCKSIZE;
+	init_bitgraph();
+	root = (struct FCB*)malloc(sizeof(struct FCB));
+	long curfcb_offset, root_offset;
+	//读取全局变量
+	fread(openfilelist,sizeof(char),sizeof(openfilelist),var);
+	fread(&curdir,sizeof(char),sizeof(curdir),var);
+	fread(currentdir,sizeof(char),sizeof(currentdir),var);
+	fread(bitgraph,sizeof(char),sizeof(bitgraph),var);
+	fread(&fd,sizeof(char),sizeof(fd),var);
+	fread(root,sizeof(char),sizeof(struct FCB),var);
+	
+	//加上偏移量
+	startp = myvhard + 5 * BLOCKSIZE;
+	curfcb = root;
+	strcpy(currentdir, " /");
+	fclose(mem);
+	fclose(var);
+}
+
+void my_exitsys()
+{		//李浚铭
+	FILE* mem = fopen("mem","w");
+	FILE* var = fopen("var","w");
+
+	long curfcb_offset = (unsigned char*)curfcb - myvhard;
+	long root_offset = (unsigned char*)root - myvhard;
+
+	fwrite(myvhard,sizeof(char),SIZE,mem);
+
+	fwrite(openfilelist,sizeof(char),sizeof(openfilelist),var);
+	fwrite(&curdir,sizeof(char),sizeof(curdir),var);
+	fwrite(currentdir,sizeof(char),sizeof(currentdir),var);
+	fwrite(bitgraph,sizeof(char),sizeof(bitgraph),var);
+	fwrite(&fd,sizeof(char),sizeof(fd),var);
+	fwrite(root,sizeof(char),sizeof(struct FCB),var);
+
+	fclose(mem);
+	fclose(var);
+}
+
+void my_cd(char* dirname)
+{
+	char* first_add = get_add(curfcb -> first);
+	int i;
+	struct FCB* t = (struct FCB*)first_add;
+	for(i = 0;i < (curfcb->length)/sizeof(struct FCB);i++)
+	{
+		if(strcmp(dirname, (t+i)->filename) == 0)
+		{
+			if((t+i)->attribute != 0)
+			{
+				printf("%s is not a directory !\n",dirname);
+				return;
+			}
+			if(strcmp((t+i)->filename,"..") == 0)
+			{
+				if(curfcb == root)
+					return;
+				int l = strlen(currentdir);
+				for(int j = l-2;j > 0;j--)
+				{
+					if(*(currentdir+j) == '/')
+					{
+						*(currentdir+j+1) = '\0';
+						break;
+					}
+				}
+				curfcb = (t+i);
+				curdir = curfcb -> fd;
+			}
+			else if(strcmp((t+i)->filename,".") == 0)
+			{
+				curdir = curfcb -> fd;
+			}
+			else
+			{
+				curfcb = (t+i);
+				curdir = curfcb -> fd;
+				strcat(currentdir, dirname);
+				strcat(currentdir, "/");
+			}
+			return;
+		}
+	}
+	printf("there is no directory called %s !\n",dirname);
+}
+
+void my_mkdir(char* dirname)
+{
+	char* first_add = get_add(curfcb -> first);
+	time_t ptime;
+	struct tm* p;
+	time(&ptime);
+	p = gmtime(&ptime);
+	int i;
+	int block;
+
+	//检查是否有重名文件
+	struct FCB* t = (struct FCB*)first_add;		//t是当前目录所对应盘块号的首地址
+	for(i = 0;i < (curfcb->length/sizeof(struct FCB));i++)
+	{
+		if(strcmp(dirname, (t+i)->filename) == 0)
+		{
+			printf("the directory is already exist\n");
+			return;
+		}
+	}
+
+	//分配盘块号	
+	block = get_free_block();
+
+
+	//在FCB中填入基本信息
+	strcpy((t+i)->filename, dirname);
+	(t+i)->attribute = 0;
+	(t+i)->hour = p->tm_hour;
+	(t+i)->min = p->tm_min;
+	(t+i)->mon = p->tm_mon;
+	(t+i)->day = p->tm_mday;
+	(t+i)->first = block;
+	(t+i)->length = 2*sizeof(struct FCB);		//初始有两个目录项，.和..
+	(t+i)->free = 0;
+	(t+i)->fd = fd++;
+
+	//更新FAT
+	update_FAT(t+i,FILL);
+	
+	//更新位示图
+	update_bitgraph(block,FILL);
+
+	//更新当前目录的信息	
+	curfcb->length += sizeof(struct FCB);
+	curfcb->free = 1;
+	
+	//将该目录下所有子目录的..长度信息更新
+	for(i = 2;i < (curfcb->length/sizeof(struct FCB));i++)
+	{
+		if((t+i) -> attribute == 0)
+		{
+			(((struct FCB*)get_add((t+i)->first))+1) -> length = curfcb -> length;
+		}
+	}
+
+	//在新的目录块中填入.和..的信息
+	first_add = get_add(block);
+	t = (struct FCB*)first_add;
+	strcpy(t->filename,".");
+	t -> attribute = 0;
+	(t)->hour = p->tm_hour;
+	(t)->min = p->tm_min;
+	(t)->mon = p->tm_mon;
+	(t)->day = p->tm_mday;
+	(t)->first = block;
+	(t)->length = 2*sizeof(struct FCB);
+	(t)->free = 0;
+
+	strcpy((t+1)->filename,"..");
+	(t+1) -> attribute = 0;
+	(t+1)->hour = p->tm_hour;
+	(t+1)->min = p->tm_min;
+	(t+1)->mon = p->tm_mon;
+	(t+1)->day = p->tm_mday;
+	(t+1)->first = curfcb->first;
+	(t+1)->length = curfcb->length;
+	(t+1)->free = 1;
+
+}
+
+void my_ls()
+{
+	char* first_add = get_add(curfcb->first);
+	struct FCB* t = (struct FCB*)first_add;
+	printf("文件名		标识符		文件类型	创建时间\n");
+	for(int i = 0;i < (curfcb->length)/sizeof(struct FCB);i++)
+	{
+		if(strcmp((t+i) -> filename, "..") == 0 || strcmp((t+i) -> filename, ".") == 0)
+			printf("%s\n",(t+i)->filename);
+		else
+		{
+			printf("%s		%ld		%d		%d月 %d日 %d:%d\n",(t+i)->filename,(t+i)->fd,(t+i)->attribute,(t+i)->mon,(t+i)->day,(t+i)->hour,(t+i)->min);
+		}
+	}
+}
+
+void my_create(char* fname)
+{
+	char* first_add = get_add(curfcb->first);
+	struct FCB* t = (struct FCB*)first_add;
+	int i;
+
+	time_t ptime;
+	struct tm* p;
+	time(&ptime);
+	p = gmtime(&ptime);
+
+	for(i = 0;i < curfcb->length/sizeof(struct FCB);i++)
+	{
+		if(strcmp((t+i)->filename, fname) == 0)
+		{
+			printf("the file is already exists\n");
+			return;
+		}
+	}
+
+	//更新当前目录的信息，新增加一个FCB
+	strcpy((t+i)->filename, fname);
+	(t+i) -> attribute = 1;
+	(t+i) -> mon = p -> tm_mon;
+	(t+i) -> day = p -> tm_mday;
+	(t+i) -> hour = p -> tm_hour;
+	(t+i) -> min = p -> tm_min;
+	(t+i) -> length = 0;
+	(t+i) -> free = 0;
+	(t+i) -> fd = fd++;
+
+	//分配一个空闲块
+	int block = get_free_block();
+
+	(t+i) -> first = block;
+	t = (struct FCB*)get_add(block);
+
+	//更新当前目录
+	curfcb -> length += sizeof(struct FCB);
+
+	//更新位示图和FAT表
+	update_FAT(t, FILL);
+	update_bitgraph(block, FILL);
+
+	t = (struct FCB*)first_add;	
+	for(i = 2;i < (curfcb->length/sizeof(struct FCB));i++)
+	{
+		if((t+i)->attribute == 0)
+		{
+			(((struct FCB*)get_add((t+i)->first))+1) -> length = curfcb -> length;
+		}
+	}
+}
+
+void my_rm(char* fname)
+{
+	char* first_add = get_add(curfcb -> first);
+	struct FCB* t = (struct FCB*)first_add;
+	int i;
+	for(i = 0;i < curfcb->length/sizeof(struct FCB);i++)
+	{
+		if(strcmp((t+i)->filename, fname) == 0)
+		{
+			if((t+i) -> attribute == 0)
+			{
+				printf("%s is a directory\n",fname);
+				return;
+			}
+			
+			update_bitgraph((t+i)->first, MOVE);
+			update_FAT((t+i), MOVE);
+			int length = (curfcb->length)/sizeof(struct FCB);
+			//把磁盘块中最后一个文件的FCB复制到删除的文件的位置上
+			strcpy((t+i)->filename,(t-1+length)->filename);
+			(t+i) -> attribute = (t-1+length) -> attribute;
+			(t+i) -> mon = (t-1+length) -> mon;
+			(t+i) -> day = (t-1+length) -> day;
+			(t+i) -> hour = (t-1+length) -> hour;
+			(t+i) -> min = (t-1+length) -> min;
+			(t+i) -> first = (t-1+length) -> first;
+			(t+i) -> length = (t-1+length) -> length;
+			(t+i) -> free = (t-1+length) -> free;
+			(t+i) -> fd = (t-1+length) -> fd;
+
+			(curfcb -> length) -= sizeof(struct FCB);
+			return;
+		}
+	}
+	printf("there is no file called %s\n",fname);
+}
+
+void my_rmdir(char* dirname, struct FCB* curfcb)
+{
+	char* first_add = get_add(curfcb -> first);
+	struct FCB* t = (struct FCB*)first_add;
+	int i;
+	for(i = 0;i < curfcb->length/sizeof(struct FCB);i++)
+	{
+		if(strcmp((t+i)->filename, dirname) == 0)
+		{
+			if((t+i)->length/sizeof(struct FCB) <= 2)
+			{
+				update_bitgraph((t+i)->first, MOVE);
+				update_FAT((t+i),MOVE);
+				int length = (curfcb->length)/sizeof(struct FCB);
+				//把磁盘块中最后一个文件的FCB复制到删除的文件的位置上
+				strcpy((t+i)->filename,(t-1+length)->filename);
+				(t+i) -> attribute = (t-1+length) -> attribute;
+				(t+i) -> mon = (t-1+length) -> mon;
+				(t+i) -> day = (t-1+length) -> day;
+				(t+i) -> hour = (t-1+length) -> hour;
+				(t+i) -> min = (t-1+length) -> min;
+				(t+i) -> first = (t-1+length) -> first;
+				(t+i) -> length = (t-1+length) -> length;
+				(t+i) -> free = (t-1+length) -> free;
+				(t+i) -> fd = (t-1+length) -> fd;
+				
+				(curfcb -> length) -= sizeof(struct FCB);
+				return;
+			}
+			else
+			{
+				struct FCB* new_t = (struct FCB*)get_add((t+i)->first);
+				for(int j = 2;j < (new_t+i)->length/sizeof(struct FCB);i++)
+				{
+					if((new_t+j)->attribute == 1)
+					{
+						update_bitgraph((new_t+j)->first, MOVE);
+						update_FAT((new_t+j), MOVE);
+						(t+i) -> length -= sizeof(struct FCB);
+					}
+					else
+						my_rmdir((new_t+j)->filename, (t+i));
+				}
+				update_bitgraph((t+i)->first, MOVE);
+				update_FAT((t+i),MOVE);
+				int length = (curfcb->length)/sizeof(struct FCB);
+				//把磁盘块中最后一个文件的FCB复制到删除的文件的位置上
+				strcpy((t+i)->filename,(t-1+length)->filename);
+				(t+i) -> attribute = (t-1+length) -> attribute;
+				(t+i) -> mon = (t-1+length) -> mon;
+				(t+i) -> day = (t-1+length) -> day;
+				(t+i) -> hour = (t-1+length) -> hour;
+				(t+i) -> min = (t-1+length) -> min;
+				(t+i) -> first = (t-1+length) -> first;
+				(t+i) -> length = (t-1+length) -> length;
+				(t+i) -> free = (t-1+length) -> free;
+				(t+i) -> fd = (t-1+length) -> fd;
+
+				(curfcb -> length) -= sizeof(struct FCB);
+				return;
+			}
+		}
+	}
+	printf("no such directory\n");
+}
+
+/*
+ * 截断写
+ */
+void my_over_write(char* filename)
+{
+	int index = test_exist(filename, 1);
+	if(index == -1)
+	{
+		printf("file not found\n");
+		return;
+	}
+	struct FCB* t = (struct FCB*)get_add(curfcb->first);
+	t = t + index;
+	char* file_add = get_add(along_FAT(t -> first));
+	(t->length) = 0;
+	char c = getchar();			//消化刚刚的回车，如果没有这行，会多一个换行符
+	char* buf = (char*)malloc(BLOCKSIZE);	//缓冲区
+	char* ptr = buf;			//缓冲区的指针
+	while(1)
+	{
+		scanf("%c",&c);
+		if(c == '$')			//以$为结束标志
+		{
+			*ptr = '\0';
+			strcpy(file_add,buf);
+			(t -> length) += strlen(buf);
+			break;
+		}
+		if(ptr == buf+BLOCKSIZE-1)		//写满一块
+		{
+			*ptr = '\0';
+			strcpy(file_add,buf);
+			(t -> length) += strlen(buf);
+			ptr = buf;
+			update_FAT(t,FILL);		//分配一个新的块
+			file_add = get_add(along_FAT(t -> first));	//file_add指向新块的首地址
+		}
+		*(ptr) = c;
+		ptr++;
+	}
+}
+
+/*
+ * 追加写
+ */
+void my_add_write(char* filename)
+{
+	int index = test_exist(filename, 1);
+	if(index == -1)
+	{
+		printf("file not found\n");
+		return;
+	}
+	struct FCB* t = (struct FCB*)get_add(curfcb->first);
+	t = t + index;
+	char* file_add = get_add(along_FAT(t->first));
+	int offset = (t->length) % BLOCKSIZE;		//文件最后一块中的偏移量
+	file_add += offset;
+	char c = getchar();				//消化回车
+	char* buf = (char*)malloc(BLOCKSIZE);
+	char* ptr = buf;
+	while(1)
+	{
+		c = getchar();
+		if(c == '$')
+		{
+			*(ptr) = '\0';
+			strcpy(file_add,buf);
+			(t -> length) += strlen(buf);
+			break;
+		}
+		if(strlen(buf) == BLOCKSIZE-offset-1)
+		{
+			*(ptr) = '\0';
+			strcpy(file_add,buf);
+			(t -> length) += strlen(buf);
+			ptr = buf;
+			update_FAT(t,FILL);				//分配一个新的块
+			update_bitgraph(get_free_block(), FILL);
+			file_add = get_add(along_FAT(t -> first));	//file_add指向新块的首地址
+			offset = 0;
+		}
+		*(ptr) = c;
+		ptr++;
+	}
+}
+
+void my_write(char* filename)
+{
+	int op;
+	int index = test_exist(filename,1);
+	struct FCB* t = (struct FCB*)get_add(curfcb->first);
+	t = t + index;						//指向该文件FCB
+	int i;
+	for(i = 0;i < MAXOPENFILE;i++)
+	{
+		if(openfilelist[i].topenfile == 1 && openfilelist[i].fd == t -> fd)
+			break;
+	}
+	if(i == MAXOPENFILE)
+	{
+		printf("file not open yet\n");
+		return;
+	}
+	printf("选择写类型 0:截断写，1:追加写\n");
+	scanf("%d",&op);
+	if(op == 0)
+		my_over_write(filename);
+	else if(op == 1)
+		my_add_write(filename);
+	else
+		printf("command not found\n");
+}
+
+void my_read(char* filename, int len)//张爽
+{
+	char* first_add = get_add(curfcb -> first);
+	struct FCB* t = (struct FCB*)first_add;
+	int i;
+	for(i = 0;i < curfcb->length/sizeof(struct FCB);i++)
+	{
+		if(strcmp((t+i)->filename, filename) == 0)
+		{
+			if((t+i)->attribute == 0)				//检查是否是普通文件
+			{
+				printf("%s is a directory\n",filename);
+				return;
+			}
+			int j;
+			for(j = 0;j < MAXOPENFILE;j++)				//检查文件是否打开
+			{
+				if(openfilelist[j].topenfile == 1 && openfilelist[j].fd == (t+i) -> fd)
+					break;
+			}
+			if(j == MAXOPENFILE)
+			{
+				printf("file not open yet\n");
+				return;
+			}
+			if(len > (t+i)->length - openfilelist[j].count)		//检查文件是否够读
+			{
+				printf("too much to read\n");
+				return;
+			}
+			int block = (t+i) -> first;				//当前块号
+			char* file_add = get_add((t+i)->first);			//文件第一块的首地址
+			int count = openfilelist[j].count;
+			while(count > BLOCKSIZE)
+			{							//定位file_add到待读的块
+				file_add = get_add(FAT_next(block));
+				count -= BLOCKSIZE;
+			}
+			file_add += count;
+			if(len > BLOCKSIZE - count)				//判断读取的长度是否大于当前块剩余长度
+			{
+				printf("%s",file_add);
+				len -= BLOCKSIZE - count;
+				block = FAT_next(block);
+				file_add = get_add(block);
+				openfilelist[j].count += BLOCKSIZE - count;
+			}
+			while(len - BLOCKSIZE > 0)				//读取长度大于一个块的长度
+			{
+				printf("%s",file_add);
+				len -= BLOCKSIZE;
+				block = FAT_next(block);
+				file_add = get_add(block);
+				openfilelist[j].count += BLOCKSIZE;
+			}
+			for(int k = 0;k < len;k++)
+			{
+				printf("%c",*(file_add+k));
+				openfilelist[j].count ++;
+			}
+			printf("\n");
+			return;
+		}
+	}
+	printf("file not found\n");
+}
+
+
+void my_close(int fd){                                                //李明嘉
+	int flag = 0;
+	int i;
+	for(i = 0;i < MAXOPENFILE;i++){
+		if(openfilelist[i].fd == fd){
+			flag = 1;
+			break;
+		}
+	}
+	if(flag == 0 || openfilelist[i].topenfile == 0){                                             //检查fd的有效性
+		printf("the fd is invalid\n");
+		return;
+	}
+	if(openfilelist[i].fcbstate == 1){            //检查FCB是否更改过，若是则将修改保存到父目录文件中
+		openfilelist[i].file -> length = openfilelist[i].length;
+		openfilelist[i].file -> first = openfilelist[i].first;
+	}
+	openfilelist[i].file = root;                           //清空用户打开文件表表项
+	strcpy(openfilelist[i].dir, "/");
+	openfilelist[i].count = 0;
+	openfilelist[i].fcbstate = 0;
+	openfilelist[i].topenfile = 0;
+}
+
+void my_open(char* fname)		 //林晨兴
+{
+	char* first_add = get_add(curfcb -> first);
+	struct FCB* t = (struct FCB*)first_add;
+	int i,j;
+	for(i = 0;i < curfcb->length/sizeof(struct FCB);i++)
+	{
+		if(strcmp((t+i)->filename, fname) == 0) //确认文件存在，然后判断文件是否打开
+		{
+			t = t + i;
+			int flag = 0;
+			for(j = 0;j < MAXOPENFILE;j++)
+			{
+				if(openfilelist[j].topenfile == 1 && openfilelist[j].file -> fd == t->fd)
+				{
+					printf("the fd is already open\n");
+					return;
+				}
+			}
+			for(j = 0;j < MAXOPENFILE;j++)
+			{
+				if(openfilelist[j].topenfile == 0)
+				{
+					openfilelist[j].fd = t -> fd;
+					openfilelist[j].file = t;
+					strcpy(openfilelist[j].dir, currentdir);
+					openfilelist[j].count = 0;
+					openfilelist[j].fcbstate = 0;
+					openfilelist[j].topenfile = 1;
+					break;
+				}
+			}
+			return;
+		}
+	}
+	printf("there is no file called %s\n",fname);
+	return;
+}
+
+void my_shell()
+{
+	char command[20];
+	char t[80];
+	int fd;
+	int len;
+	while(1)
+	{
+		printf("%s # ",currentdir);
+		scanf("%s",command);
+		if(strcmp(command, "my_mkdir") == 0)
+		{
+			printf("input the directry name:\n");
+			scanf("%s",t);
+			my_mkdir(t);
+		}
+		else if(strcmp(command, "my_ls") == 0)
+			my_ls();
+		else if(strcmp(command, "my_cd") == 0)
+		{
+			printf("input the directry name:\n");
+			scanf("%s",t);
+			my_cd(t);
+		}
+		else if(strcmp(command, "my_create") == 0)
+		{
+			printf("input filename:\n");
+			scanf("%s",t);
+			my_create(t);
+		}
+		else if(strcmp(command, "my_rm") == 0)
+		{
+			printf("input filename:\n");
+			scanf("%s",t);
+			my_rm(t);
+		}
+		else if(strcmp(command, "my_rmdir") == 0)
+		{
+			printf("input filename:\n");
+			scanf("%s",t);
+			my_rmdir(t,curfcb);
+		}
+		else if(strcmp(command, "my_write") == 0)
+		{
+			printf("input the filename\n");
+			scanf("%s",t);
+			my_write(t);
+		}
+		else if(strcmp(command, "my_read") == 0)
+		{
+			printf("input the filename and length to read\n");
+			scanf("%s",t);
+			scanf("%d",&len);
+			my_read(t,len);
+		}
+		else if(strcmp(command, "my_open") == 0)
+		{
+			printf("input the filename\n");
+			scanf("%s",t);
+			my_open(t);
+		}
+		else if(strcmp(command, "my_close") == 0)
+		{
+			printf("input fd\n");
+			scanf("%d",&fd);
+			my_close(fd);
+		}
+		else if(strcmp(command, "my_exit") == 0)
+		{
+			my_exitsys();
+			return;
+		}
+		else
+			printf("shell command not found\n");
+	}
+}
+
+
+int main()
+{
+	startsys();
+	my_shell();
+	return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
